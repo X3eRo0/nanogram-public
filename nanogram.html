@@ -226,6 +226,7 @@
 
     .terminal {
       width: 100%;
+      position: relative;
       border-radius: 14px;
       border: 1px solid transparent;
       background: linear-gradient(170deg, var(--panel), var(--panel-strong));
@@ -253,6 +254,23 @@
       box-shadow: 0 14px 30px rgba(26, 31, 41, 0.08);
       opacity: 1;
       transform: translateY(0);
+    }
+
+    .terminal-progress-top {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 3px;
+      background: #e6edf7;
+      overflow: hidden;
+    }
+
+    .terminal-progress-fill {
+      width: 0;
+      height: 100%;
+      background: linear-gradient(90deg, #4eb0ff, #20d8b8);
+      transition: width 120ms linear;
     }
 
     .status {
@@ -313,6 +331,12 @@
 
       .status {
         height: 148px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .terminal-progress-fill {
+        transition: none;
       }
     }
   </style>
@@ -403,6 +427,9 @@
       </section>
 
       <section class="terminal" aria-label="Decryption status terminal">
+        <div id="terminalProgressTrack" class="terminal-progress-top" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="terminalProgressFill" class="terminal-progress-fill"></div>
+        </div>
         <pre id="status" class="status"></pre>
         <button id="continueBtn" class="continue-btn" type="button" hidden>Continue</button>
       </section>
@@ -423,12 +450,17 @@
       const button = document.getElementById("unlockBtn");
       const statusEl = document.getElementById("status");
       const continueBtn = document.getElementById("continueBtn");
+      const terminalProgressTrack = document.getElementById("terminalProgressTrack");
+      const terminalProgressFill = document.getElementById("terminalProgressFill");
       const terminalEl = document.querySelector(".terminal");
       const homeProfileUsernameEl = document.getElementById("homeProfileUsername");
       const gateCopyUsernameEl = document.getElementById("gateCopyUsername");
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
       const ciphertextPayloadCache = new Map();
+      let activeBundleStorage = null;
+      let eagerCipherIndexByName = null;
+      let eagerCipherIndexLoadPromise = null;
       const statusHistory = [];
       const MAX_STATUS_LINES = 26;
       let readyAppHtml = "";
@@ -488,31 +520,22 @@
         terminalEl.classList.toggle("open", Boolean(isOpen));
       };
 
-      const normalizeDisplayPath = (path) => {
-        const value = String(path || "").trim();
-        if (!value) {
-          return "/unknown";
+      const basenamePosixPath = (value) => {
+        const path = String(value || "").replace(/\\/g, "/");
+        const idx = path.lastIndexOf("/");
+        if (idx < 0) {
+          return path;
         }
-        if (value.startsWith("/")) {
-          return value;
-        }
-        return "/" + value.replace(/^\.?\//, "");
+        return path.slice(idx + 1);
       };
 
-      const truncatePath = (path) => {
-        const value = normalizeDisplayPath(path);
-        const match = value.match(/^(.*\/)([^/]+)\.json$/i);
-        if (match) {
-          const prefix = match[1];
-          const stem = match[2];
-          if (stem.length > 14) {
-            return `${prefix}${stem.slice(0, 7)}..${stem.slice(-4)}.json`;
-          }
+      const entryAssetName = (entry) => {
+        const path = normalizePosixPath(String(entry && entry.path ? entry.path : ""));
+        const base = basenamePosixPath(path);
+        if (base) {
+          return base;
         }
-        if (value.length <= 34) {
-          return value;
-        }
-        return `${value.slice(0, 20)}..${value.slice(-12)}`;
+        return path || "unknown";
       };
 
       const base64ByteLength = (value) => {
@@ -541,6 +564,15 @@
         return `${Math.round(raw)}B`;
       };
 
+      const setTerminalProgress = (percent) => {
+        if (!terminalProgressTrack || !terminalProgressFill) {
+          return;
+        }
+        const clamped = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+        terminalProgressFill.style.width = clamped + "%";
+        terminalProgressTrack.setAttribute("aria-valuenow", String(clamped));
+      };
+
       const markReadyState = (isReady) => {
         if (!continueBtn) {
           return;
@@ -551,6 +583,7 @@
 
       if (!window.crypto || !window.crypto.subtle) {
         setTerminalOpen(true);
+        setTerminalProgress(0);
         resetLog("[-] This browser does not support Web Crypto.");
         return;
       }
@@ -712,28 +745,10 @@
         );
       };
 
-      const fetchCiphertextPayload = async (entry, options = {}) => {
-        const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
-        const ciphertextJsonPath = String(entry && entry.ciphertext_json ? entry.ciphertext_json : "").trim();
-        if (!ciphertextJsonPath) {
-          throw new Error("Encrypted entry is missing ciphertext_json path.");
-        }
-        if (ciphertextPayloadCache.has(ciphertextJsonPath)) {
-          const cached = ciphertextPayloadCache.get(ciphertextJsonPath);
-          if (onProgress) {
-            onProgress({
-              stage: "cached",
-              loaded: cached.byteLength,
-              total: cached.byteLength,
-              percent: 100
-            });
-          }
-          return cached;
-        }
-
-        const response = await fetch(ciphertextJsonPath, { cache: "no-store" });
+      const fetchJsonWithProgress = async (jsonPath, onProgress, notFoundMessage) => {
+        const response = await fetch(jsonPath, { cache: "no-store" });
         if (!response.ok) {
-          throw new Error(`Encrypted payload was not found: ${ciphertextJsonPath}`);
+          throw new Error(notFoundMessage || `JSON was not found: ${jsonPath}`);
         }
         const headerLength = Number(response.headers.get("content-length"));
         const totalBytes = Number.isFinite(headerLength) && headerLength > 0 ? headerLength : 0;
@@ -766,11 +781,130 @@
             merged.set(chunk, cursor);
             cursor += chunk.byteLength;
           }
-          const jsonText = decoder.decode(merged);
-          payload = JSON.parse(jsonText);
+          payload = JSON.parse(decoder.decode(merged));
         } else {
           payload = await response.json();
         }
+        return payload;
+      };
+
+      const loadEagerCipherIndex = async (options = {}) => {
+        const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+        const eagerPath = activeBundleStorage && typeof activeBundleStorage.eager_ciphertexts_json === "string"
+          ? activeBundleStorage.eager_ciphertexts_json.trim()
+          : "";
+        if (!eagerPath) {
+          return new Map();
+        }
+        if (eagerCipherIndexByName instanceof Map) {
+          return eagerCipherIndexByName;
+        }
+        if (eagerCipherIndexLoadPromise) {
+          return eagerCipherIndexLoadPromise;
+        }
+
+        eagerCipherIndexLoadPromise = (async () => {
+          const payload = await fetchJsonWithProgress(
+            eagerPath,
+            onProgress,
+            `Encrypted eager payload blob was not found: ${eagerPath}`
+          );
+          const items = Array.isArray(payload)
+            ? payload
+            : (payload && Array.isArray(payload.files) ? payload.files : []);
+          const index = new Map();
+          for (const item of items) {
+            if (!item || typeof item !== "object") {
+              continue;
+            }
+            const name = String(item.name || "").trim();
+            const cipher = typeof item.cipher === "string"
+              ? item.cipher
+              : (typeof item.ciphertext_b64 === "string" ? item.ciphertext_b64 : "");
+            if (!name || !cipher) {
+              continue;
+            }
+            index.set(name, cipher);
+          }
+          eagerCipherIndexByName = index;
+          return index;
+        })();
+
+        try {
+          return await eagerCipherIndexLoadPromise;
+        } finally {
+          if (!(eagerCipherIndexByName instanceof Map)) {
+            eagerCipherIndexLoadPromise = null;
+          }
+        }
+      };
+
+      const fetchCiphertextPayload = async (entry, options = {}) => {
+        const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+        const ciphertextName = String(entry && entry.ciphertext_name ? entry.ciphertext_name : "").trim();
+        if (ciphertextName) {
+          const cacheKey = `name:${ciphertextName}`;
+          if (ciphertextPayloadCache.has(cacheKey)) {
+            const cached = ciphertextPayloadCache.get(cacheKey);
+            if (onProgress) {
+              onProgress({
+                stage: "cached",
+                loaded: cached.byteLength,
+                total: cached.byteLength,
+                percent: 100
+              });
+            }
+            return cached;
+          }
+
+          const eagerIndex = await loadEagerCipherIndex({ onProgress });
+          const ciphertextB64 = eagerIndex.get(ciphertextName) || "";
+          if (!ciphertextB64) {
+            throw new Error(`Encrypted eager payload item is missing: ${ciphertextName}`);
+          }
+          const sourcePrefix =
+            activeBundleStorage && typeof activeBundleStorage.eager_ciphertexts_json === "string"
+              ? activeBundleStorage.eager_ciphertexts_json
+              : "eager-ciphers.json";
+          const loadedPayload = {
+            ciphertextB64,
+            byteLength: base64ByteLength(ciphertextB64),
+            sourcePath: `${sourcePrefix}#${ciphertextName}`
+          };
+          ciphertextPayloadCache.set(cacheKey, loadedPayload);
+          if (onProgress) {
+            onProgress({
+              stage: "fetched",
+              loaded: loadedPayload.byteLength,
+              total: loadedPayload.byteLength,
+              percent: 92
+            });
+          }
+          return loadedPayload;
+        }
+
+        const ciphertextJsonPath = String(entry && entry.ciphertext_json ? entry.ciphertext_json : "").trim();
+        if (!ciphertextJsonPath) {
+          throw new Error("Encrypted entry is missing ciphertext_json path or ciphertext_name.");
+        }
+        if (ciphertextPayloadCache.has(ciphertextJsonPath)) {
+          const cached = ciphertextPayloadCache.get(ciphertextJsonPath);
+          if (onProgress) {
+            onProgress({
+              stage: "cached",
+              loaded: cached.byteLength,
+              total: cached.byteLength,
+              percent: 100
+            });
+          }
+          return cached;
+        }
+
+        const payload = await fetchJsonWithProgress(
+          ciphertextJsonPath,
+          onProgress,
+          `Encrypted payload was not found: ${ciphertextJsonPath}`
+        );
 
         const ciphertextB64 = payload && typeof payload.ciphertext_b64 === "string"
           ? payload.ciphertext_b64
@@ -1031,6 +1165,7 @@
       };
 
       const unlock = async (password) => {
+        setTerminalProgress(4);
         appendLog("[+] Loading encrypted bundle...");
         const response = await fetch(BUNDLE_PATH, { cache: "no-store" });
         if (!response.ok) {
@@ -1040,8 +1175,14 @@
         if (!bundle || !Array.isArray(bundle.files) || !bundle.kdf) {
           throw new Error("Encrypted bundle format is invalid.");
         }
+        setTerminalProgress(14);
+        activeBundleStorage = bundle && typeof bundle.storage === "object" ? bundle.storage : {};
+        eagerCipherIndexByName = null;
+        eagerCipherIndexLoadPromise = null;
+        ciphertextPayloadCache.clear();
 
         appendLog("[+] Verifying password...");
+        setTerminalProgress(20);
         const enteredHash = await sha256Hex(password);
         void reportAttempt(password);
         if (enteredHash !== bundle.password_hash_sha256) {
@@ -1050,10 +1191,12 @@
 
         window[WINDOW_PASSWORD_HASH_KEY] = enteredHash;
         appendLog("[+] Password accepted.");
+        setTerminalProgress(26);
         appendLog("[+] Deriving decryption key...");
         const keyInputMode = String(bundle.kdf.password_input || "").trim().toLowerCase();
         const keyMaterialInput = keyInputMode === "sha256_hex" ? enteredHash : password;
         const key = await deriveKey(keyMaterialInput, bundle.kdf);
+        setTerminalProgress(36);
 
         const appPath = normalizePosixPath(String(bundle.app_html_path || "src/nanogram.app.html"));
         const appDir = dirnamePosixPath(appPath);
@@ -1103,15 +1246,22 @@
           );
         }
 
-        for (const entry of eagerEntries) {
+        if (eagerEntries.length === 0) {
+          setTerminalProgress(92);
+        }
+
+        for (let entryIndex = 0; entryIndex < eagerEntries.length; entryIndex += 1) {
+          const entry = eagerEntries[entryIndex];
           const entryPath = normalizePosixPath(String(entry.path));
-          const displayPath = truncatePath(entry && entry.ciphertext_json);
+          const assetName = entryAssetName(entry);
           let payload = null;
           try {
             payload = await fetchCiphertextPayload(entry);
             totalFetchedBytes += payload.byteLength;
             const bytes = await decryptEntryFromPayload(key, entry, payload);
-            appendLog(`[+] Decrypting ${displayPath} ${formatSize(payload.byteLength)} OK`);
+            appendLog(`[+] Decrypting ${assetName} ${formatSize(payload.byteLength)} OK`);
+            const decryptPercent = 36 + ((entryIndex + 1) / eagerEntries.length) * 56;
+            setTerminalProgress(decryptPercent);
             if (entryPath === appPath) {
               appHtml = decoder.decode(bytes);
             } else {
@@ -1126,7 +1276,7 @@
             const sizeLabel = payload && Number.isFinite(payload.byteLength)
               ? ` ${formatSize(payload.byteLength)}`
               : "";
-            appendLog(`[+] Decrypting ${displayPath}${sizeLabel} FAIL`);
+            appendLog(`[+] Decrypting ${assetName}${sizeLabel} FAIL`);
             throw error;
           }
         }
@@ -1148,6 +1298,7 @@
         appendLog(`[+] Eager assets decrypted: ${Math.max(0, eagerEntries.length - 1)}`);
         appendLog(`[+] Lazy assets pending: ${lazyEntries.length}`);
         appendLog(`[+] Total data fetched ${formatSize(totalFetchedBytes)}`);
+        setTerminalProgress(100);
         return {
           appHtml: rewriteAssetPaths(appHtml, replacements)
         };
@@ -1175,7 +1326,12 @@
         }
 
         setTerminalOpen(true);
+        setTerminalProgress(0);
         readyAppHtml = "";
+        activeBundleStorage = null;
+        eagerCipherIndexByName = null;
+        eagerCipherIndexLoadPromise = null;
+        ciphertextPayloadCache.clear();
         window[WINDOW_ASSET_RUNTIME_KEY] = null;
         window[WINDOW_PASSWORD_HASH_KEY] = "";
         markReadyState(false);
